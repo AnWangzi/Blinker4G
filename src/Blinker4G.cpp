@@ -17,6 +17,7 @@ Blinker4G::Blinker4G(uint8_t rxPin, uint8_t txPin, uint32_t baud, const char* cm
     _lastHeartbeat = 0;
     _lastDataReport = 0;
     _lastCredsCheck = 0;
+    _recvBuffer = "";
 }
 
 // ==================== 初始化 ====================
@@ -360,18 +361,23 @@ void Blinker4G::handleConnected() {
         sendState("online");
     }
     
-    // ✅ 每 60 秒检查一次 MQTT 连接状态
+    // MQTT 状态检查
     if (millis() - _lastCredsCheck > 60000) {
         _lastCredsCheck = millis();
         String resp = sendAT("AT+MQTTSTA", AT_TIMEOUT_SHORT);
         Serial.printf("[Blinker4G] MQTT status: %s\n", resp.c_str());
         
-        // 明确返回 DISCONNECTION 才判定断连
         if (resp.indexOf("\"DISCONNECTION\"") >= 0) {
-            Serial.println(F("[Blinker4G] ⚠️ MQTT disconnected!"));
+            // ✅ 真的断连了，再判断是凭证过期还是网络问题
+            if (millis() - _config.obtainedAt > 3600000) {
+                Serial.println(F("[Blinker4G] Credentials expired, refreshing..."));
+            } else {
+                Serial.println(F("[Blinker4G] MQTT disconnected, reconnecting..."));
+            }
             changeState(STATE_DISCONNECTED);
             return;
         }
+        // 连着呢，不用管
     }
     
     // 接收数据
@@ -382,12 +388,6 @@ void Blinker4G::handleConnected() {
             Serial.printf("[RAW] %s\n", line.c_str());
             handleIncoming(line.c_str());
         }
-    }
-    
-    // 凭证过期
-    if (millis() - _config.obtainedAt > 3600000) {
-        Serial.println(F("[Blinker4G] Credentials expired"));
-        changeState(STATE_DISCONNECTED);
     }
 }
 

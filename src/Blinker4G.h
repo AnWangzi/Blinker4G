@@ -58,6 +58,8 @@ private:
     unsigned long _lastHeartbeat;
     unsigned long _lastDataReport;
     unsigned long _lastCredsCheck;
+
+    String _recvBuffer;  // 接收缓冲
     
     void (*_dataCallback)(const char* data) = nullptr;
     void (*_stateCallback)(const char* state) = nullptr;
