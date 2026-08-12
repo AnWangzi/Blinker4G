@@ -4,12 +4,15 @@
 #include <Arduino.h>
 #include <SoftwareSerial.h>
 #include <ArduinoJson.h>
+#include "Blinker4GLog.h"
+#include "Blinker4GModuleDriver.h"
 #include "Blinker4GConfig.h"
 
 class Blinker4G {
 public:
     Blinker4G(uint8_t rxPin, uint8_t txPin, uint32_t baud = 9600,
               const char* cmdPassword = "usr.cn#");
+    Blinker4G(Stream& serial, const char* cmdPassword = "usr.cn#");
     
     void begin(const char* authKey);
     void run();
@@ -32,13 +35,18 @@ public:
     void clearCredentials();
 
 private:
+    friend class Blinker4GWhLte7S0Driver;
+
     uint8_t _rxPin, _txPin;
     uint32_t _baud;
     const char* _cmdPassword;
     String _authKey;
     
-    SoftwareSerial* _moduleSerial;
+    Stream* _moduleSerial;
+    SoftwareSerial* _softwareSerial;
+    bool _ownsSerial;
     Blinker4GConfig _config;
+    Blinker4GModuleDriver _driver;
     
     enum State {
         STATE_INIT,
@@ -75,7 +83,9 @@ private:
     bool configureMqtt();
     
     void publishData(const char* payload);
+    bool receiveEnabled() const;
     void handleIncoming(const char* rawData);
+    void pollIncoming();
     void processStateMachine();
     
     void handleInit();

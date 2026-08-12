@@ -1,19 +1,26 @@
 #include "Blinker4G.h"
 
-static const char* BLINKER_AUTH_HOST = "iot.diandeng.tech";
-static const uint16_t BLINKER_AUTH_PORT = 80;
-static const char* BLINKER_AUTH_PATH = "/api/v1/user/device/diy/auth";
-
-static const unsigned long AT_TIMEOUT_LONG = 15000;
-static const unsigned long AT_TIMEOUT_MID = 5000;
-static const unsigned long AT_TIMEOUT_SHORT = 2000;
-
 // ==================== 构造函数 ====================
 Blinker4G::Blinker4G(uint8_t rxPin, uint8_t txPin, uint32_t baud, const char* cmdPassword)
     : _rxPin(rxPin), _txPin(txPin), _baud(baud), _cmdPassword(cmdPassword) {
     _state = STATE_INIT;
     _prevState = STATE_INIT;
     _moduleSerial = nullptr;
+    _softwareSerial = nullptr;
+    _ownsSerial = true;
+    _lastHeartbeat = 0;
+    _lastDataReport = 0;
+    _lastCredsCheck = 0;
+    _recvBuffer = "";
+}
+
+Blinker4G::Blinker4G(Stream& serial, const char* cmdPassword)
+    : _rxPin(0), _txPin(0), _baud(0), _cmdPassword(cmdPassword) {
+    _state = STATE_INIT;
+    _prevState = STATE_INIT;
+    _moduleSerial = &serial;
+    _softwareSerial = nullptr;
+    _ownsSerial = false;
     _lastHeartbeat = 0;
     _lastDataReport = 0;
     _lastCredsCheck = 0;
@@ -23,13 +30,30 @@ Blinker4G::Blinker4G(uint8_t rxPin, uint8_t txPin, uint32_t baud, const char* cm
 // ==================== 初始化 ====================
 void Blinker4G::begin(const char* authKey) {
     _authKey = String(authKey);
-    _moduleSerial = new SoftwareSerial(_rxPin, _txPin);
-    _moduleSerial->begin(_baud);
-    
-    Serial.println(F("\n[Blinker4G] Starting..."));
-    Serial.printf("[Blinker4G] RX:%d TX:%d Baud:%d\n", _rxPin, _txPin, _baud);
-    Serial.printf("[Blinker4G] CMD Password: %s\n", _cmdPassword);
-    
+    if (_ownsSerial) {
+        if (_softwareSerial) {
+            delete _softwareSerial;
+        }
+        _softwareSerial = new SoftwareSerial(_rxPin, _txPin);
+        _softwareSerial->begin(_baud);
+        _moduleSerial = _softwareSerial;
+    }
+
+    BLINKER4G_LOG_INFO("CORE", "Starting");
+    if (_ownsSerial) {
+        BLINKER4G_LOG_INFO("CORE", "RX:%d TX:%d Baud:%d", _rxPin, _txPin, _baud);
+        BLINKER4G_LOG_INFO("CORE", "Serial backend: SoftwareSerial");
+    } else {
+        BLINKER4G_LOG_INFO("CORE", "Serial backend: external Stream");
+    }
+    BLINKER4G_LOG_INFO("CORE", "Module: %s", _driver.name());
+#if BLINKER4G_ENABLE_DEBUG
+    BLINKER4G_LOG_INFO("CORE", "Debug logging: enabled");
+#else
+    BLINKER4G_LOG_INFO("CORE", "Debug logging: disabled");
+#endif
+    BLINKER4G_LOG_INFO("CORE", "RX policy: %s", receiveEnabled() ? "enabled" : "disabled");
+
     changeState(STATE_INIT);
 }
 
@@ -46,22 +70,36 @@ void Blinker4G::changeState(State newState) {
         "TRY_MQTT", "CONF_MQTT", "WAIT_CONNECT",
         "CONNECTED", "DISCONNECTED"
     };
-    Serial.printf("[Blinker4G] %s -> %s\n", stateNames[_state], stateNames[newState]);
+
+    BLINKER4G_LOG_INFO("STATE", "%s -> %s", stateNames[_state], stateNames[newState]);
     _prevState = _state;
     _state = newState;
     _stateEnterTime = millis();
+
+    if (_stateCallback) {
+        _stateCallback(stateNames[newState]);
+    }
+    if (newState == STATE_CONNECTED && _connectCallback) {
+        _connectCallback();
+    }
+    if (newState == STATE_DISCONNECTED && _disconnectCallback) {
+        _disconnectCallback();
+    }
 }
 
 // ==================== AT 指令 ====================
 String Blinker4G::sendAT(const char* cmd, unsigned long timeoutMs) {
+    if (!_moduleSerial) return "";
+
     while (_moduleSerial->available()) _moduleSerial->read();
-    
+
     String fullCmd = String(_cmdPassword) + String(cmd);
+    BLINKER4G_LOG_DEBUG("AT", ">>> %s", cmd);
     _moduleSerial->println(fullCmd);
-    
+
     String response = "";
     unsigned long startMs = millis();
-    
+
     while (millis() - startMs < timeoutMs) {
         while (_moduleSerial->available()) {
             response += (char)_moduleSerial->read();
@@ -69,60 +107,56 @@ String Blinker4G::sendAT(const char* cmd, unsigned long timeoutMs) {
         if (response.indexOf("OK") >= 0 || response.indexOf("ERROR") >= 0) break;
         delay(10);
     }
+    if (response.length() == 0) {
+        BLINKER4G_LOG_DEBUG("AT", "<<< <no response>");
+    } else {
+        response.replace("\r", "\\r");
+        response.replace("\n", "\\n");
+        BLINKER4G_LOG_DEBUG("AT", "<<< %s", response.c_str());
+    }
     return response;
 }
 
 // ==================== 模块初始化 ====================
 bool Blinker4G::initModule() {
-    Serial.println(F("[Blinker4G] Initializing module..."));
+    BLINKER4G_LOG_INFO("CORE", "Initializing module");
     for (int i = 0; i < 3; i++) {
-        String resp = sendAT("AT+VER", AT_TIMEOUT_SHORT);
+        String resp = sendAT("AT+VER", Blinker4GModuleDriver::AT_TIMEOUT_SHORT);
         if (resp.indexOf("+VER:") >= 0 || resp.indexOf("OK") >= 0) {
-            Serial.println(F("[Blinker4G] ✅ Module OK"));
+            BLINKER4G_LOG_INFO("CORE", "Module OK");
             break;
         }
-        if (i == 2) { Serial.println(F("[Blinker4G] ❌ No response")); return false; }
+        if (i == 2) {
+            BLINKER4G_LOG_ERROR("CORE", "Module did not respond");
+            return false;
+        }
         delay(1000);
     }
-    sendAT("AT+CSQ", AT_TIMEOUT_SHORT);
-    sendAT("AT+SYSINFO", AT_TIMEOUT_SHORT);
+
+    sendAT("AT+CSQ", Blinker4GModuleDriver::AT_TIMEOUT_SHORT);
+    sendAT("AT+SYSINFO", Blinker4GModuleDriver::AT_TIMEOUT_SHORT);
     return true;
 }
 
 // ==================== 配置 HTTP 基础参数 ====================
 bool Blinker4G::configureHttpBase() {
-    Serial.println(F("[Blinker4G] Configuring HTTP base..."));
-    char cmd[256];
-    
-    if (sendAT("AT+WKMOD=HTTPD", AT_TIMEOUT_MID).indexOf("OK") < 0) return false;
-    delay(1000);
-    if (sendAT("AT+HTPTP=GET", AT_TIMEOUT_SHORT).indexOf("OK") < 0) return false;
-    
-    sprintf(cmd, "AT+HTPSV=%s,%d", BLINKER_AUTH_HOST, BLINKER_AUTH_PORT);
-    if (sendAT(cmd, AT_TIMEOUT_SHORT).indexOf("OK") < 0) return false;
-    
-    sprintf(cmd, "AT+HTPURL=%s?", BLINKER_AUTH_PATH);
-    if (sendAT(cmd, AT_TIMEOUT_SHORT).indexOf("OK") < 0) return false;
-    
-    sendAT("AT+HTPHD=Accept:text/html[0D][0A]", AT_TIMEOUT_SHORT);
-    sendAT("AT+HTPPK=OFF", AT_TIMEOUT_SHORT);
-    sendAT("AT+S", AT_TIMEOUT_MID);
-    return true;
+    BLINKER4G_LOG_INFO("HTTP", "Configuring HTTP base");
+    return _driver.configureHttpBase(*this);
 }
 
 // ==================== 获取凭证 ====================
 bool Blinker4G::getCredentials() {
-    Serial.println(F("[Blinker4G] Getting credentials..."));
-    
+    BLINKER4G_LOG_INFO("AUTH", "Requesting device credentials");
+
     while (_moduleSerial->available()) _moduleSerial->read();
-    
+
     String trigger = "authKey=" + _authKey;
-    _moduleSerial->print(trigger);
-    
+    _moduleSerial->println(trigger);
+
     String response = "";
     unsigned long startMs = millis();
-    
-    while (millis() - startMs < 15000) {
+
+    while (millis() - startMs < Blinker4GModuleDriver::AT_TIMEOUT_LONG) {
         while (_moduleSerial->available()) response += (char)_moduleSerial->read();
         if (response.indexOf("detail") >= 0 && response.indexOf('}') >= 0) {
             delay(500);
@@ -131,123 +165,146 @@ bool Blinker4G::getCredentials() {
         }
         delay(50);
     }
-    
-    Serial.printf("[Blinker4G] Response (%d bytes): %s\n", response.length(), response.c_str());
-    
-    int jsonStart = response.indexOf("\r\n\r\n");
-    if (jsonStart >= 0) jsonStart += 4;
-    else jsonStart = response.indexOf('{');
-    if (jsonStart < 0) return false;
-    
-    String jsonStr = response.substring(jsonStart);
-    jsonStr.trim();
-    
-    StaticJsonDocument<1024> doc;
-    if (deserializeJson(doc, jsonStr)) return false;
-    
-    JsonObject detail = doc["detail"];
-    if (!detail) return false;
-    
-    _config.iotId = detail["iotId"] | "";
-    _config.iotToken = detail["iotToken"] | "";
-    _config.port = detail["port"] | 1883;
-    _config.deviceName = detail["deviceName"] | "";
-    _config.deviceId = detail["uuid"] | "";
-    
-    const char* host = detail["host"] | "";
-    if (strlen(host) > 0) {
-        const char* p = strstr(host, "://");
-        _config.broker = String(p ? p + 3 : host);
-    } else {
-        _config.broker = "broker.diandeng.tech";
+
+    BLINKER4G_LOG_DEBUG("AUTH", "Response length: %d", response.length());
+
+    if (!_driver.parseCredentialsResponse(response, _config)) {
+        BLINKER4G_LOG_ERROR("AUTH", "Failed to parse credential response");
+        return false;
     }
-    
-    _config.valid = (_config.iotId.length() > 0 && _config.iotToken.length() > 0 && _config.deviceId.length() > 0);
-    _config.obtainedAt = millis();
-    
+
     if (_config.valid) {
         _config.save();
-        Serial.printf("[Blinker4G] ✅ Device: %s\n", _config.deviceId.c_str());
+        BLINKER4G_LOG_INFO("AUTH", "Credentials ready for device %s", _config.deviceId.c_str());
     }
     return _config.valid;
 }
 
 // ==================== 配置 MQTT ====================
 bool Blinker4G::configureMqtt() {
-    Serial.println(F("[Blinker4G] Configuring MQTT..."));
-    char cmd[256];
-    
-    if (sendAT("AT+WKMOD=MQTT,NOR", AT_TIMEOUT_MID).indexOf("OK") < 0) return false;
-    delay(500);
-    
-    sprintf(cmd, "AT+MQTTSVR=%s,%d", _config.broker.c_str(), _config.port);
-    sendAT(cmd, AT_TIMEOUT_SHORT);
-    
-    sprintf(cmd, "AT+MQTTCID=%s", _config.iotId.c_str());
-    sendAT(cmd, AT_TIMEOUT_SHORT);
-    
-    sprintf(cmd, "AT+MQTTUSER=%s", _config.iotId.c_str());
-    sendAT(cmd, AT_TIMEOUT_SHORT);
-    
-    sprintf(cmd, "AT+MQTTPSW=%s", _config.iotToken.c_str());
-    sendAT(cmd, AT_TIMEOUT_SHORT);
-    
-    sprintf(cmd, "AT+MQTTSUBTP=1,1,/device/%s/r,0", _config.deviceName.c_str());
-    sendAT(cmd, AT_TIMEOUT_SHORT);
-    
-    sprintf(cmd, "AT+MQTTPUBTP=1,1,/device/%s/s,0,0", _config.deviceName.c_str());
-    sendAT(cmd, AT_TIMEOUT_SHORT);
-    
-    sendAT("AT+S", AT_TIMEOUT_MID);
-    return true;
+    BLINKER4G_LOG_INFO("MQTT", "Configuring MQTT");
+    return _driver.configureMqtt(*this, _config);
 }
 
 // ==================== 发布 ====================
 void Blinker4G::publishData(const char* payload) {
-    String msg = "1," + String(payload);
-    _moduleSerial->println(msg);
+    if (!_moduleSerial) return;
+    BLINKER4G_LOG_INFO("TX", "%s", payload);
+    _moduleSerial->println(_driver.buildPublishFrame(payload));
+}
+
+bool Blinker4G::receiveEnabled() const {
+#if BLINKER4G_RX_POLICY == BLINKER4G_RX_POLICY_FORCE_OFF
+    return false;
+#elif BLINKER4G_RX_POLICY == BLINKER4G_RX_POLICY_FORCE_ON
+    return true;
+#else
+#if BLINKER4G_PLATFORM_ESP8266
+    return !_ownsSerial;
+#else
+    return true;
+#endif
+#endif
 }
 
 void Blinker4G::sendState(const char* state) {
     if (_state != STATE_CONNECTED) return;
-    char payload[256];
-    snprintf(payload, sizeof(payload),
-             "{\"toDevice\":\"%s\",\"data\":{\"state\":\"%s\"}}",
-             _config.deviceId.c_str(), state);
-    publishData(payload);
+    String payload = _driver.buildStatePayload(_config, state);
+    publishData(payload.c_str());
 }
 
 void Blinker4G::sendData(const char* data) {
     if (_state != STATE_CONNECTED) return;
-    char payload[256];
-    snprintf(payload, sizeof(payload),
-             "{\"toDevice\":\"%s\",\"data\":{%s}}",
-             _config.deviceId.c_str(), data);
-    publishData(payload);
+    String payload = _driver.buildDataPayload(_config, data);
+    publishData(payload.c_str());
 }
 
 // ==================== 接收处理 ====================
 void Blinker4G::handleIncoming(const char* rawData) {
-    // ✅ 去掉主题序号 "1,"
     const char* jsonStart = strchr(rawData, '{');
     if (!jsonStart) return;
-    
+
+    BLINKER4G_LOG_DEBUG("RX", "%s", rawData);
+
     StaticJsonDocument<512> doc;
-    if (deserializeJson(doc, jsonStart)) return;
-    
-    const char* fromDevice = doc["fromDevice"];
+    if (deserializeJson(doc, jsonStart)) {
+        BLINKER4G_LOG_ERROR("RX", "Failed to parse incoming payload");
+        return;
+    }
+
     JsonObject jsonData = doc["data"].as<JsonObject>();
-    if (!fromDevice || jsonData.isNull()) return;
-    
+    if (jsonData.isNull()) {
+        BLINKER4G_LOG_ERROR("RX", "Incoming message does not contain data field");
+        return;
+    }
+
     if (_dataCallback) {
         String dataStr;
         serializeJson(jsonData, dataStr);
+        BLINKER4G_LOG_INFO("RX", "%s", dataStr.c_str());
         _dataCallback(dataStr.c_str());
     }
-    
+
     const char* getCmd = jsonData["get"];
     if (getCmd && strcmp(getCmd, "state") == 0) {
         sendState("online");
+    }
+}
+
+void Blinker4G::pollIncoming() {
+    if (!receiveEnabled()) {
+        while (_moduleSerial && _moduleSerial->available()) {
+            _moduleSerial->read();
+        }
+        _recvBuffer = "";
+        return;
+    }
+
+    while (_moduleSerial && _moduleSerial->available()) {
+        char ch = (char)_moduleSerial->read();
+
+        if (_recvBuffer.length() == 0) {
+            if (ch == '{') {
+                _recvBuffer += ch;
+            }
+            continue;
+        }
+
+        _recvBuffer += ch;
+
+        if (_recvBuffer.length() > 512) {
+            BLINKER4G_LOG_ERROR("RX", "Buffered frame exceeded 512 bytes, dropping");
+            _recvBuffer = "";
+            continue;
+        }
+
+        int braceDepth = 0;
+        bool inString = false;
+        bool escaped = false;
+        for (size_t i = 0; i < _recvBuffer.length(); ++i) {
+            char current = _recvBuffer[i];
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (current == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (current == '"') {
+                inString = !inString;
+                continue;
+            }
+            if (inString) continue;
+            if (current == '{') braceDepth++;
+            if (current == '}') braceDepth--;
+        }
+
+        if (braceDepth == 0) {
+            BLINKER4G_LOG_DEBUG("RX", "Buffered frame complete: %s", _recvBuffer.c_str());
+            handleIncoming(_recvBuffer.c_str());
+            _recvBuffer = "";
+        }
     }
 }
 
@@ -259,20 +316,20 @@ const char* Blinker4G::getIotId() { return _config.iotId.c_str(); }
 
 // ==================== 工具函数 ====================
 void Blinker4G::restartModule() {
-    sendAT("AT+Z", AT_TIMEOUT_MID);
+    sendAT("AT+Z", Blinker4GModuleDriver::AT_TIMEOUT_MID);
     delay(5000);
     initModule();
 }
 
 void Blinker4G::factoryReset() {
-    sendAT("AT+CLEAR", AT_TIMEOUT_MID);
+    sendAT("AT+CLEAR", Blinker4GModuleDriver::AT_TIMEOUT_MID);
     delay(5000);
     initModule();
 }
 
 void Blinker4G::clearCredentials() {
     Blinker4GConfig::clear();
-    _config.valid = false;
+    _config = Blinker4GConfig();
 }
 
 // ==================== 状态机 ====================
@@ -297,20 +354,22 @@ void Blinker4G::handleInit() {
 
 void Blinker4G::handleLoadEeprom() {
     if (_config.load()) {
-        Serial.println(F("[Blinker4G] Found saved credentials"));
+        BLINKER4G_LOG_INFO("AUTH", "Found saved credentials");
         changeState(STATE_TRY_CONNECT_MQTT);
     } else {
-        Serial.println(F("[Blinker4G] No saved credentials"));
+        BLINKER4G_LOG_INFO("AUTH", "No saved credentials");
         changeState(STATE_CONFIGURE_HTTP);
     }
 }
 
 void Blinker4G::handleConfigureHttp() {
     if (configureHttpBase()) {
-        delay(8000);
+        delay(Blinker4GModuleDriver::MQTT_BOOT_SETTLE_MS);
         initModule();
         changeState(STATE_GET_CREDENTIALS);
-    } else delay(10000);
+    } else {
+        delay(10000);
+    }
 }
 
 void Blinker4G::handleGetCredentials() {
@@ -320,7 +379,8 @@ void Blinker4G::handleGetCredentials() {
 
 void Blinker4G::handleTryConnectMqtt() {
     if (configureMqtt()) {
-        delay(8000);
+        _lastCredsCheck = 0;
+        delay(Blinker4GModuleDriver::MQTT_BOOT_SETTLE_MS);
         initModule();
         changeState(STATE_WAIT_MQTT_CONNECT);
     } else {
@@ -331,68 +391,74 @@ void Blinker4G::handleTryConnectMqtt() {
 
 void Blinker4G::handleConfigureMqtt() {
     if (configureMqtt()) {
-        delay(8000);
+        _lastCredsCheck = 0;
+        delay(Blinker4GModuleDriver::MQTT_BOOT_SETTLE_MS);
         initModule();
         changeState(STATE_WAIT_MQTT_CONNECT);
-    } else changeState(STATE_GET_CREDENTIALS);
+    } else {
+        changeState(STATE_GET_CREDENTIALS);
+    }
 }
 
 void Blinker4G::handleWaitMqttConnect() {
     unsigned long elapsed = millis() - _stateEnterTime;
-    if (elapsed > 30000) {
+    if (elapsed < Blinker4GModuleDriver::MQTT_BOOT_SETTLE_MS) {
+        return;
+    }
+
+    if (millis() - _lastCredsCheck < Blinker4GModuleDriver::MQTT_STATUS_POLL_MS) {
+        return;
+    }
+
+    _lastCredsCheck = millis();
+    String resp = sendAT("AT+MQTTSTA", Blinker4GModuleDriver::AT_TIMEOUT_SHORT);
+    BLINKER4G_LOG_DEBUG("MQTT", "Status response: %s", resp.c_str());
+
+    if (_driver.isMqttConnectedResponse(resp)) {
+        _lastHeartbeat = millis() - Blinker4GModuleDriver::HEARTBEAT_INTERVAL_MS;
+        _lastCredsCheck = millis();
+        changeState(STATE_CONNECTED);
+        return;
+    }
+
+    if (elapsed > Blinker4GModuleDriver::MQTT_CONNECT_TIMEOUT_MS) {
         if (_prevState == STATE_TRY_CONNECT_MQTT) {
-            Serial.println(F("[Blinker4G] EEPROM credentials failed"));
+            BLINKER4G_LOG_ERROR("MQTT", "Saved credentials failed, fallback to HTTP auth");
             Blinker4GConfig::clear();
             _config.valid = false;
             changeState(STATE_CONFIGURE_HTTP);
-        } else changeState(STATE_GET_CREDENTIALS);
-    } else if (elapsed > 15000) {
-        _lastHeartbeat = millis() - 30000;
-        _lastCredsCheck = millis();
-        changeState(STATE_CONNECTED);
-        if (_connectCallback) _connectCallback();
+        } else {
+            changeState(STATE_GET_CREDENTIALS);
+        }
     }
 }
 
 void Blinker4G::handleConnected() {
-    // 心跳
-    if (millis() - _lastHeartbeat > 30000) {
+    if (millis() - _lastHeartbeat > Blinker4GModuleDriver::HEARTBEAT_INTERVAL_MS) {
         _lastHeartbeat = millis();
         sendState("online");
     }
-    
-    // MQTT 状态检查
-    if (millis() - _lastCredsCheck > 60000) {
+
+    if (millis() - _lastCredsCheck > Blinker4GModuleDriver::MQTT_STATUS_CHECK_MS) {
         _lastCredsCheck = millis();
-        String resp = sendAT("AT+MQTTSTA", AT_TIMEOUT_SHORT);
-        Serial.printf("[Blinker4G] MQTT status: %s\n", resp.c_str());
-        
-        if (resp.indexOf("\"DISCONNECTION\"") >= 0) {
-            // ✅ 真的断连了，再判断是凭证过期还是网络问题
-            if (millis() - _config.obtainedAt > 3600000) {
-                Serial.println(F("[Blinker4G] Credentials expired, refreshing..."));
+        String resp = sendAT("AT+MQTTSTA", Blinker4GModuleDriver::AT_TIMEOUT_SHORT);
+        BLINKER4G_LOG_DEBUG("MQTT", "Status response: %s", resp.c_str());
+
+        if (!_driver.isMqttConnectedResponse(resp)) {
+            if (millis() - _config.obtainedAt > Blinker4GModuleDriver::CREDENTIAL_REFRESH_MS) {
+                BLINKER4G_LOG_INFO("MQTT", "Credentials expired, refreshing");
             } else {
-                Serial.println(F("[Blinker4G] MQTT disconnected, reconnecting..."));
+                BLINKER4G_LOG_INFO("MQTT", "Disconnected, reconnecting");
             }
             changeState(STATE_DISCONNECTED);
             return;
         }
-        // 连着呢，不用管
     }
-    
-    // 接收数据
-    while (_moduleSerial->available()) {
-        String line = _moduleSerial->readStringUntil('\n');
-        line.trim();
-        if (line.length() > 0) {
-            Serial.printf("[RAW] %s\n", line.c_str());
-            handleIncoming(line.c_str());
-        }
-    }
+
+    pollIncoming();
 }
 
 void Blinker4G::handleDisconnected() {
-    if (_disconnectCallback) _disconnectCallback();
     _config.valid = false;
     changeState(STATE_GET_CREDENTIALS);
 }

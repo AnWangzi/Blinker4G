@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <EEPROM.h>
+#include "Blinker4GLog.h"
 
 // EEPROM 配置
 #define BLINKER4G_EEPROM_SIZE        512
@@ -45,7 +46,7 @@ struct Blinker4GConfig {
         EEPROM.commit();
         EEPROM.end();
         
-        Serial.println(F("[EEPROM] Config saved"));
+        BLINKER4G_LOG_INFO("EEPROM", "Config saved");
         return true;
     }
     
@@ -57,7 +58,7 @@ struct Blinker4GConfig {
         
         // 检查魔法数字
         if (EEPROM.read(addr++) != BLINKER4G_EEPROM_MAGIC) {
-            Serial.println(F("[EEPROM] No valid data"));
+            BLINKER4G_LOG_DEBUG("EEPROM", "No valid data");
             EEPROM.end();
             return false;
         }
@@ -81,9 +82,9 @@ struct Blinker4GConfig {
         valid = (iotId.length() > 0 && iotToken.length() > 0 && deviceId.length() > 0);
         
         if (valid) {
-            Serial.println(F("[EEPROM] Config loaded"));
-            Serial.printf("  Device: %s\n", deviceId.c_str());
-            Serial.printf("  Broker: %s:%d\n", broker.c_str(), port);
+            BLINKER4G_LOG_INFO("EEPROM", "Config loaded");
+            BLINKER4G_LOG_DEBUG("EEPROM", "Device: %s", deviceId.c_str());
+            BLINKER4G_LOG_DEBUG("EEPROM", "Broker: %s:%d", broker.c_str(), port);
         }
         
         return valid;
@@ -95,7 +96,7 @@ struct Blinker4GConfig {
         EEPROM.write(BLINKER4G_EEPROM_START, 0);  // 清除魔法数字
         EEPROM.commit();
         EEPROM.end();
-        Serial.println(F("[EEPROM] Config cleared"));
+        BLINKER4G_LOG_INFO("EEPROM", "Config cleared");
     }
     
 private:
