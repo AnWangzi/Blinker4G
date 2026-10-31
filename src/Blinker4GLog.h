@@ -8,6 +8,11 @@
 
 namespace Blinker4GLog {
 
+inline Print*& output() {
+    static Print* stream = &Serial;
+    return stream;
+}
+
 enum Level {
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFO,
@@ -33,11 +38,14 @@ inline bool shouldLog(Level level) {
 }
 
 inline void vlogf(Level level, const char* tag, const char* format, va_list args) {
-    if (!shouldLog(level)) return;
+    if (!shouldLog(level) || !output()) return;
 
     char message[256];
     vsnprintf(message, sizeof(message), format, args);
-    Serial.printf("[%10lu][%s][%s] %s\n", millis(), levelName(level), tag, message);
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "[%10lu][%s][%s] ", millis(), levelName(level), tag);
+    output()->print(prefix);
+    output()->println(message);
 }
 
 inline void logf(Level level, const char* tag, const char* format, ...) {

@@ -11,7 +11,7 @@ uint16_t Blinker4GWhLte7S0Driver::authPort() const { return BLINKER_AUTH_PORT; }
 const char* Blinker4GWhLte7S0Driver::authPath() const { return BLINKER_AUTH_PATH; }
 
 bool Blinker4GWhLte7S0Driver::sendChecked(Blinker4G& owner, const char* command, unsigned long timeoutMs) const {
-    return owner.sendAT(command, timeoutMs).indexOf("OK") >= 0;
+    return owner.sendAT(command, timeoutMs).endsWith("OK\r\n");
 }
 
 bool Blinker4GWhLte7S0Driver::configureHttpBase(Blinker4G& owner) const {
@@ -64,12 +64,7 @@ bool Blinker4GWhLte7S0Driver::configureMqtt(Blinker4G& owner, const Blinker4GCon
 }
 
 bool Blinker4GWhLte7S0Driver::parseCredentialsResponse(const String& response, Blinker4GConfig& config) const {
-    int jsonStart = response.indexOf("\r\n\r\n");
-    if (jsonStart >= 0) {
-        jsonStart += 4;
-    } else {
-        jsonStart = response.indexOf('{');
-    }
+    int jsonStart = response.indexOf('{');
     if (jsonStart < 0) {
         BLINKER4G_LOG_ERROR("AUTH", "HTTP response does not contain JSON body");
         return false;
@@ -78,7 +73,7 @@ bool Blinker4GWhLte7S0Driver::parseCredentialsResponse(const String& response, B
     String jsonStr = response.substring(jsonStart);
     jsonStr.trim();
 
-    StaticJsonDocument<1024> doc;
+    DynamicJsonDocument doc(BLINKER4G_RX_FRAME_SIZE * 2);
     if (deserializeJson(doc, jsonStr)) {
         BLINKER4G_LOG_ERROR("AUTH", "Credential JSON decode failed");
         return false;
@@ -100,11 +95,15 @@ bool Blinker4GWhLte7S0Driver::parseCredentialsResponse(const String& response, B
     if (strlen(host) > 0) {
         const char* scheme = strstr(host, "://");
         config.broker = String(scheme ? scheme + 3 : host);
+        int path = config.broker.indexOf('/');
+        if (path >= 0) config.broker = config.broker.substring(0, path);
+        int colon = config.broker.indexOf(':');
+        if (colon >= 0) config.broker = config.broker.substring(0, colon);
     } else {
         config.broker = "broker.diandeng.tech";
     }
 
-    config.valid = (config.iotId.length() > 0 && config.iotToken.length() > 0 && config.deviceId.length() > 0);
+    config.valid = config.complete();
     config.obtainedAt = millis();
     if (!config.valid) {
         BLINKER4G_LOG_ERROR("AUTH", "Credential payload is incomplete");
@@ -113,7 +112,12 @@ bool Blinker4GWhLte7S0Driver::parseCredentialsResponse(const String& response, B
 }
 
 bool Blinker4GWhLte7S0Driver::isMqttConnectedResponse(const String& response) const {
-    return response.indexOf("CONNECTION") >= 0 && response.indexOf("DISCONNECTION") < 0;
+    int start = response.indexOf("+MQTTSTA:");
+    if (start < 0 || !response.endsWith("OK\r\n")) return false;
+    int end = response.indexOf('\n', start);
+    String status = response.substring(start + 9, end);
+    status.trim();
+    return status == "\"CONNECTION\"" || status == "CONNECTION";
 }
 
 bool Blinker4GWhLte7S0Driver::extractIncomingPayload(const char* rawData, String& payload) const {
@@ -122,7 +126,7 @@ bool Blinker4GWhLte7S0Driver::extractIncomingPayload(const char* rawData, String
     const char* jsonStart = strchr(rawData, '{');
     if (!jsonStart) return false;
 
-    StaticJsonDocument<512> doc;
+    DynamicJsonDocument doc(BLINKER4G_RX_FRAME_SIZE * 2);
     if (deserializeJson(doc, jsonStart)) return false;
 
     JsonObject jsonData = doc["data"].as<JsonObject>();

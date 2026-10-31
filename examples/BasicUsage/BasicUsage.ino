@@ -6,6 +6,8 @@
 #define MODULE_CMD_PASSWORD "usr.cn#"
 #define REPORT_INTERVAL_MS 15000UL
 
+// ESP8266 software serial: module TX -> GPIO4, module RX -> GPIO5.
+// Configure the module itself to 9600 baud first (factory default is 115200).
 Blinker4G blinker(MODULE_RX, MODULE_TX, 9600, MODULE_CMD_PASSWORD);
 
 float temperature = 25.0;
@@ -69,6 +71,7 @@ void reportSensorData() {
 
 void setup() {
     Serial.begin(115200);
+    Blinker4G::setLogStream(&Serial);
     pinMode(LED_BUILTIN, OUTPUT);
     applyLedState(false);
 
@@ -95,9 +98,12 @@ void setup() {
 
 void loop() {
     blinker.run();
+    // Keep loop responsive. Do not add long delays or blocking callbacks.
 
     if (blinker.isConnected() && millis() - lastReportAt >= REPORT_INTERVAL_MS) {
         lastReportAt = millis();
         reportSensorData();
+        Serial.printf("[RX] dropped=%lu overflow=%lu heap=%u\n",
+                      blinker.droppedFrames(), blinker.serialOverflows(), ESP.getFreeHeap());
     }
 }
