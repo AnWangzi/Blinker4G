@@ -230,6 +230,90 @@ static void lifecycle() {
     std::cout << "PASS initial HTTP auth -> MQTT -> cached reconnect -> explicit credential refresh\n";
 }
 
+static void connectionQuality() {
+    FakeStream stream;
+    Blinker4G b(stream);
+    ready(b);
+    b._state = Blinker4G::STATE_WAIT_MQTT_CONNECT;
+    b.changeState(Blinker4G::STATE_CONNECTED);
+    assert(b.getConnectionQuality().reconnects == 0);
+    assert(!b.getConnectionQuality().hasSignalSample);
+    int csq = -1, ber = -1;
+    assert(b._driver.parseSignalQualityResponse("+CSQ: 0,0\r\nOK\r\n", csq, ber) && csq == 0);
+    assert(b._driver.parseSignalQualityResponse("+CSQ: 31,7\r\nOK\r\n", csq, ber) && csq == 31);
+    for (const char* bad : {"+CSQ: -1,99\r\nOK\r\n", "+CSQ: 32,99\r\nOK\r\n",
+                           "+CSQ: 20,8\r\nOK\r\n", "+CSQ: 20,99junk\r\nOK\r\n",
+                           "+CSQ: 20,99\r\nERROR\r\n", "OK\r\n"}) {
+        assert(!b._driver.parseSignalQualityResponse(bad, csq, ber));
+    }
+    stream.reply = [&](const std::string& command) {
+        if (command.find("AT+CSQ") != std::string::npos) {
+            stream.feed("{\"data\":{\"duringCSQ\":true}}\r\n+CSQ: 27,99\r\nOK\r\n");
+        }
+    };
+    assert(b.reportConnectionQuality());
+    b.dispatchIncoming();
+    assert(received.size() == 1);
+    auto q = b.getConnectionQuality();
+    assert(q.hasSignalSample && q.lastSignalQueryOk && q.csq == 27 && q.rssiDbm == -59);
+    auto decodeReport = [&]() -> std::string {
+        for (auto it = stream.writes.rbegin(); it != stream.writes.rend(); ++it) {
+            if (it->find("1,{") == 0) return it->substr(2);
+        }
+        assert(false); return "";
+    };
+    DynamicJsonDocument report(2048);
+    assert(!deserializeJson(report, decodeReport()));
+    assert(report["data"]["connection"]["rssiDbm"].as<int>() == -59);
+    assert(report["data"]["connection"].size() == 12);
+    // A timed-out query retains the previous sample with an increasing age.
+    stream.reply = nullptr;
+    fakeMillis += 1000;
+    assert(b.reportConnectionQuality());
+    q = b.getConnectionQuality();
+    assert(!q.lastSignalQueryOk && q.csq == 27 && q.signalAgeMs >= 3000 && q.atTimeouts == 1);
+    assert(!deserializeJson(report, decodeReport()));
+    assert(!report["data"]["connection"]["signalQueryOk"].as<bool>());
+    // Unknown CSQ must not turn into an impossible positive dBm value.
+    stream.reply = [&](const std::string& command) {
+        if (command.find("AT+CSQ") != std::string::npos) stream.feed("+CSQ: 99,99\r\nOK\r\n");
+    };
+    assert(b.reportConnectionQuality());
+    assert(!deserializeJson(report, decodeReport()));
+    assert(report["data"]["connection"]["rssiDbm"].isNull());
+    assert(report["data"]["connection"]["csq"].as<int>() == 99);
+    b.changeState(Blinker4G::STATE_DISCONNECTED);
+    assert(!b.reportConnectionQuality() && !b.refreshConnectionQuality());
+    b.changeState(Blinker4G::STATE_DISCONNECTED);
+    b.changeState(Blinker4G::STATE_CONNECTED);
+    q = b.getConnectionQuality();
+    assert(q.reconnects == 1 && q.disconnects == 1 && q.connectedForMs == 0);
+    b._droppedFrames = 2;
+    b._serialOverflows = 3;
+    assert(b.getConnectionQuality().rxDrops == 2 && b.getConnectionQuality().serialOverflows == 3);
+    // Disabled by default; opt-in reports are rate limited and work through wraparound.
+    assert(b._qualityReportInterval == 0);
+    b.setConnectionQualityReportInterval(1000);
+    assert(b._qualityReportInterval == 30000);
+    fakeMillis = UINT32_MAX - 100;
+    b.setConnectionQualityReportInterval(30000);
+    b._lastHeartbeat = b._lastCredsCheck = fakeMillis;
+    size_t before = stream.writes.size();
+    fakeMillis += 29999;
+    b.handleConnected();
+    // Heartbeat may publish, but no signal query is due yet.
+    unsigned queries = 0;
+    for (size_t i = before; i < stream.writes.size(); ++i)
+        if (stream.writes[i].find("AT+CSQ") != std::string::npos) ++queries;
+    assert(queries == 0);
+    fakeMillis += 1;
+    b.handleConnected();
+    assert(stream.writes.back().find("\"connection\"") != std::string::npos);
+    b.setConnectionQualityReportInterval(0);
+    assert(b._qualityReportInterval == 0);
+    std::cout << "PASS signal bounds/unknown values, CSQ downlink, report JSON, cached failure, counters, scheduling\n";
+}
+
 int main() {
     Blinker4G::setLogStream(nullptr);
     receiveAndAt();
@@ -237,5 +321,6 @@ int main() {
     cache();
     reconnect();
     lifecycle();
+    connectionQuality();
     std::cout << "All regression scenarios passed.\n";
 }

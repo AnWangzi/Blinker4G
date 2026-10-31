@@ -137,6 +137,22 @@ bool Blinker4GWhLte7S0Driver::extractIncomingPayload(const char* rawData, String
     return true;
 }
 
+bool Blinker4GWhLte7S0Driver::parseSignalQualityResponse(const String& response, int& csq, int& ber) const {
+    int start = response.indexOf("+CSQ:");
+    if (start < 0 || !response.endsWith("OK\r\n")) return false;
+    int end = response.indexOf('\n', start);
+    String line = response.substring(start, end);
+    line.trim();
+    int signal, errors;
+    char extra;
+    if (sscanf(line.c_str(), "+CSQ: %d,%d %c", &signal, &errors, &extra) != 2) return false;
+    if (!((signal >= 0 && signal <= 31) || signal == 99) ||
+        !((errors >= 0 && errors <= 7) || errors == 99)) return false;
+    csq = signal;
+    ber = errors;
+    return true;
+}
+
 String Blinker4GWhLte7S0Driver::buildPublishFrame(const char* payload) const {
     String frame;
     frame.reserve(strlen(payload) + 2);

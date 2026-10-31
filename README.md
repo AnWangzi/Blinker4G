@@ -2,6 +2,8 @@
 
 通过 WH-LTE-7S0 4G 模组接入 Blinker 的 Arduino 库。HTTP 认证和 MQTT 连接由模组执行，ESP8266 负责串口通信、JSON 解析和用户逻辑。
 
+当前版本：**1.2.0**。各版本改动见 [CHANGELOG.md](CHANGELOG.md)。版本号以 `library.properties` 为准，采用 `主版本.次版本.修订版本`：不兼容的 API 变更增加主版本，兼容的新功能增加次版本，兼容的问题修复增加修订版本。每次版本更新都同步更新版本号和中文变更记录；Git 提交说明使用中文。GitHub Release 和版本标签在明确发布时再创建。
+
 ## 环境与功能
 
 - 优先支持 ESP8266；保留 ESP32 接口兼容性，ESP32 尚未进行本轮编译或实机验证。
@@ -81,6 +83,61 @@ void setup() {
 - 在线时每 60 秒查询 MQTT 状态；首次失败约 3 秒后复查，连续两次失败触发断开回调。先复用现有凭证配置 MQTT；连接等待超时后，先配置并重启到 HTTP 模式，再重新认证和配置 MQTT。
 - 不使用保存的 `millis()` 推算跨重启的凭证有效期，也不假设凭证固定一小时到期。`clearCredentials()` 会清空缓存，并在后续 `run()` 中切回 HTTP 重新认证；`restartModule()` 和 `factoryReset()` 会重新进入初始化流程，后者同时清除本地凭证。
 - 认证和配置阶段仍含同步 AT 事务及启动等待，单次 `run()` 可能持续数秒；本版本不是完全非阻塞状态机。正常通信时也请避免长时间阻塞主循环，不要在回调里递归调用 `run()`。
+
+## 连接质量上报（1.2.0）
+
+两个示例均启用了每分钟上报；库本身默认关闭，现有项目不会自动增加 MQTT 消息。在线后经过一个上报周期才发送第一份报告：
+
+```cpp
+blinker.setConnectionQualityReportInterval(60000UL); // 自动采样和上报，每分钟一次
+blinker.setConnectionQualityReportInterval(0);       // 关闭自动上报
+```
+
+以上是两种设置方式，实际项目选择其一。非零周期最短为 30 秒，避免频繁 AT 查询和上报。断网时暂停，重连后重新计时；不补发离线期间的报告。也可手动调用：
+
+```cpp
+bool sampled = blinker.refreshConnectionQuality(); // 在线时查询 AT+CSQ，可能等待约 2 秒
+auto quality = blinker.getConnectionQuality();     // 读取缓存和计数，不发 AT，不上报
+bool written = blinker.reportConnectionQuality(); // 查询信号后发送一份报告
+```
+
+`refreshConnectionQuality()` 返回本次是否收到有效的 CSQ 应答，CSQ=99 也属于有效应答，但代表信号未知。离线或正在处理其他 AT 事务时返回 false。`reportConnectionQuality()` 返回是否已向模组写出报告，不表示服务器确认送达；即使本次信号查询失败，在线时仍上报旧采样及失败标记。
+
+报告通过现有 Blinker MQTT 数据通道发送，内容位于 `data.connection`，例如：
+
+```json
+{
+  "connection": {
+    "connected": true,
+    "signalQueryOk": true,
+    "csq": 27,
+    "ber": 99,
+    "rssiDbm": -59,
+    "signalAgeMs": 0,
+    "connectedForMs": 60000,
+    "reconnects": 0,
+    "disconnects": 0,
+    "atTimeouts": 0,
+    "rxDrops": 0,
+    "serialOverflows": 0
+  }
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `csq` / `ber` | 模组 `AT+CSQ` 返回的原始值；99 表示未知，不把 BER 编号当百分比 |
+| `rssiDbm` | CSQ 0..31 对应的近似 RSSI（`2 * CSQ - 113`），不是 LTE RSRP、网速或端到端延迟 |
+| `signalQueryOk` / `signalAgeMs` | 最近一次信号查询是否成功、最近有效采样距现在的毫秒数；失败后保留旧采样并继续计算年龄 |
+| `connectedForMs` | 当前 MQTT 连接在本地状态机中的持续时间；离线时缓存接口返回 0 |
+| `reconnects` | 第一次连接之后成功连接的次数，不是重试次数 |
+| `disconnects` | 本地状态机离开 CONNECTED 的次数，包含主动重置或重新认证 |
+| `atTimeouts` | 所有 AT 事务未收到完整终止应答的累计次数，包含初始化及信号查询 |
+| `rxDrops` / `serialOverflows` | 接收组帧丢弃事件及库内软串口溢出计数，语义同现有统计接口 |
+
+尚无有效采样时，报告中的 `csq`、`ber`、`rssiDbm` 和 `signalAgeMs` 为 `null`；CSQ=99 时 `rssiDbm` 为 `null`。C++ 缓存接口通过 `hasSignalSample` 区分是否已有采样；只有采样存在且 `csq` 在 0..31 时，`rssiDbm` 才有效。计数自库实例创建起累计，不写入 EEPROM，设备重启后清零。毫秒时间采用 `millis()`，约 49.7 天回绕；单段时间按无符号差值计算。
+
+这份报告是诊断数据，不是网络丢包率或送达证明。Blinker App 不会自动新增显示组件；如需在 App 展示，请按自己的组件或数据处理逻辑读取这些字段。
 
 ## 配置与缓存升级
 

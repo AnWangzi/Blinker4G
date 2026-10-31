@@ -72,6 +72,7 @@ void reportSensorData() {
 void setup() {
     Serial.begin(115200);
     Blinker4G::setLogStream(&Serial);
+    blinker.setConnectionQualityReportInterval(60000UL);
     pinMode(LED_BUILTIN, OUTPUT);
     applyLedState(false);
 

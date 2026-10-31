@@ -10,6 +10,22 @@
 
 class Blinker4G {
 public:
+    struct ConnectionQuality {
+        bool connected = false;
+        bool hasSignalSample = false;
+        bool lastSignalQueryOk = false;
+        int csq = 99;
+        int ber = 99;
+        int rssiDbm = 0; // Meaningful only when csq is 0..31.
+        unsigned long signalAgeMs = 0;
+        unsigned long connectedForMs = 0;
+        unsigned long reconnects = 0; // Successful connections after the first.
+        unsigned long disconnects = 0;
+        unsigned long atTimeouts = 0;
+        unsigned long rxDrops = 0;
+        unsigned long serialOverflows = 0;
+    };
+
     Blinker4G(uint8_t rxPin, uint8_t txPin, uint32_t baud = 9600,
               const char* cmdPassword = "usr.cn#");
     Blinker4G(Stream& serial, const char* cmdPassword = "usr.cn#");
@@ -22,6 +38,11 @@ public:
     static void setLogStream(Print* stream) { Blinker4GLog::output() = stream; }
     unsigned long droppedFrames() const { return _droppedFrames; }
     unsigned long serialOverflows() const { return _serialOverflows; }
+    ConnectionQuality getConnectionQuality() const;
+    bool refreshConnectionQuality();
+    bool reportConnectionQuality();
+    // 0 disables automatic reports; nonzero intervals are at least 30 seconds.
+    void setConnectionQualityReportInterval(unsigned long intervalMs);
     
     void onData(void (*callback)(const char* data));
     void onState(void (*callback)(const char* state));
@@ -88,6 +109,10 @@ private:
     bool _lineOverflow = false;
     bool _hasWritten = false;
     unsigned long _lastWriteAt = 0;
+    ConnectionQuality _quality;
+    bool _hasConnected = false;
+    unsigned long _connectedAt = 0, _signalSampleAt = 0;
+    unsigned long _qualityReportInterval = 0, _lastQualityReportAt = 0;
     
     void (*_dataCallback)(const char* data) = nullptr;
     void (*_stateCallback)(const char* state) = nullptr;
@@ -96,6 +121,7 @@ private:
     
     void changeState(State newState);
     String sendAT(const char* cmd, unsigned long timeoutMs);
+    bool sampleSignalQuality();
     
     bool initModule();
     bool configureHttpBase();

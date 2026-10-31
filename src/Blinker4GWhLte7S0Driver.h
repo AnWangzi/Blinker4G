@@ -28,6 +28,7 @@ public:
     bool configureMqtt(Blinker4G& owner, const Blinker4GConfig& config) const;
     bool parseCredentialsResponse(const String& response, Blinker4GConfig& config) const;
     bool isMqttConnectedResponse(const String& response) const;
+    bool parseSignalQualityResponse(const String& response, int& csq, int& ber) const;
     bool extractIncomingPayload(const char* rawData, String& payload) const;
     String buildPublishFrame(const char* payload) const;
     String buildStatePayload(const Blinker4GConfig& config, const char* state) const;

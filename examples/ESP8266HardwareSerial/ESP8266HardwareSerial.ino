@@ -15,6 +15,7 @@ unsigned long sequence = 0;
 void setup() {
     Serial1.begin(115200);
     Blinker4G::setLogStream(&Serial1);
+    blinker.setConnectionQualityReportInterval(60000UL);
     Serial.setRxBufferSize(1024);
     Serial.begin(9600);  // Must match the module's configured baud rate.
     Serial.swap();

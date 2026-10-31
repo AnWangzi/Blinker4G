@@ -83,6 +83,13 @@ void Blinker4G::changeState(State newState) {
     };
 
     BLINKER4G_LOG_INFO("STATE", "%s -> %s", stateNames[_state], stateNames[newState]);
+    if (_state == STATE_CONNECTED && newState != STATE_CONNECTED) ++_quality.disconnects;
+    if (_state != STATE_CONNECTED && newState == STATE_CONNECTED) {
+        if (_hasConnected) ++_quality.reconnects;
+        _hasConnected = true;
+        _connectedAt = millis();
+        _lastQualityReportAt = millis();
+    }
     _prevState = _state;
     _state = newState;
     _stateEnterTime = millis();
@@ -116,6 +123,7 @@ String Blinker4G::sendAT(const char* cmd, unsigned long timeoutMs) {
         delay(1);
     }
     _atActive = false;
+    if (!_atDone) ++_quality.atTimeouts;
     // Never expose echoed MQTT passwords through debug logs.
     BLINKER4G_LOG_DEBUG("AT", "Response: %u bytes, complete=%d", _atResponse.length(), _atDone);
     return _atDone ? _atResponse : String();
@@ -137,7 +145,7 @@ bool Blinker4G::initModule() {
         waitWithReceive(1000);
     }
 
-    sendAT("AT+CSQ", Blinker4GModuleDriver::AT_TIMEOUT_SHORT);
+    sampleSignalQuality();
     sendAT("AT+SYSINFO", Blinker4GModuleDriver::AT_TIMEOUT_SHORT);
     return true;
 }
@@ -212,6 +220,72 @@ void Blinker4G::sendData(const char* data) {
     if (_state != STATE_CONNECTED) return;
     String payload = _driver.buildDataPayload(_config, data);
     publishData(payload.c_str());
+}
+
+Blinker4G::ConnectionQuality Blinker4G::getConnectionQuality() const {
+    ConnectionQuality quality = _quality;
+    quality.connected = _state == STATE_CONNECTED;
+    quality.connectedForMs = quality.connected ? millis() - _connectedAt : 0;
+    quality.signalAgeMs = quality.hasSignalSample ? millis() - _signalSampleAt : 0;
+    quality.rssiDbm = quality.csq >= 0 && quality.csq <= 31 ? quality.csq * 2 - 113 : 0;
+    quality.rxDrops = _droppedFrames;
+    quality.serialOverflows = _serialOverflows;
+    return quality;
+}
+
+bool Blinker4G::sampleSignalQuality() {
+    String response = sendAT("AT+CSQ", Blinker4GModuleDriver::AT_TIMEOUT_SHORT);
+    int csq, ber;
+    _quality.lastSignalQueryOk = _driver.parseSignalQualityResponse(response, csq, ber);
+    if (_quality.lastSignalQueryOk) {
+        _quality.csq = csq;
+        _quality.ber = ber;
+        _quality.hasSignalSample = true;
+        _signalSampleAt = millis();
+    }
+    return _quality.lastSignalQueryOk;
+}
+
+bool Blinker4G::refreshConnectionQuality() {
+    if (_state != STATE_CONNECTED || _atActive) return false;
+    return sampleSignalQuality();
+}
+
+void Blinker4G::setConnectionQualityReportInterval(unsigned long intervalMs) {
+    _qualityReportInterval = intervalMs && intervalMs < 30000UL ? 30000UL : intervalMs;
+    _lastQualityReportAt = millis();
+}
+
+bool Blinker4G::reportConnectionQuality() {
+    if (_state != STATE_CONNECTED || _atActive) return false;
+    _lastQualityReportAt = millis();
+    refreshConnectionQuality();
+    ConnectionQuality quality = getConnectionQuality();
+    StaticJsonDocument<768> doc;
+    JsonObject connection = doc.createNestedObject("connection");
+    connection["connected"] = quality.connected;
+    connection["signalQueryOk"] = quality.lastSignalQueryOk;
+    connection["csq"] = nullptr;
+    connection["ber"] = nullptr;
+    connection["rssiDbm"] = nullptr;
+    connection["signalAgeMs"] = nullptr;
+    if (quality.hasSignalSample) {
+        connection["csq"] = quality.csq;
+        connection["ber"] = quality.ber;
+        connection["signalAgeMs"] = quality.signalAgeMs;
+        if (quality.csq >= 0 && quality.csq <= 31) connection["rssiDbm"] = quality.rssiDbm;
+    }
+    connection["connectedForMs"] = quality.connectedForMs;
+    connection["reconnects"] = quality.reconnects;
+    connection["disconnects"] = quality.disconnects;
+    connection["atTimeouts"] = quality.atTimeouts;
+    connection["rxDrops"] = quality.rxDrops;
+    connection["serialOverflows"] = quality.serialOverflows;
+    String fields;
+    serializeJson(doc, fields);
+    fields = fields.substring(1, fields.length() - 1);
+    sendData(fields.c_str());
+    return true; // Written to the module, not an MQTT delivery acknowledgement.
 }
 
 // ==================== 接收处理 ====================
@@ -518,6 +592,9 @@ void Blinker4G::handleConnected() {
     }
 
     pollIncoming();
+    if (_qualityReportInterval && millis() - _lastQualityReportAt >= _qualityReportInterval) {
+        reportConnectionQuality();
+    }
 }
 
 void Blinker4G::handleDisconnected() {
